@@ -5,7 +5,7 @@
 ---
 
 ## Reference
-Il firmware utilizzato per il prototipo è basato sul progetto realizzato da EDU INAF (link https://play.inaf.it/transiti-con-arduino/) 
+Il firmware utilizzato per il prototipo è basato sul progetto realizzato da PLAY-INAF (link https://play.inaf.it/transiti-con-arduino/) 
 
 
 ## Project Overview
