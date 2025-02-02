@@ -28,7 +28,7 @@ Il firmware utilizzato per il prototipo è basato sul progetto realizzato da PLA
 - **Microcontroller**: Arduino Uno R3 per il prototipo e Arduino Nano per il modello implementato
 
 **Connessioni:**
-- LDR e il potenziometro sono connessi in parallelo al pin A0 per entrmabi i modelli
+- LDR e il potenziometro sono connessi in parallelo al pin A0 per entrambi i modelli
 
 ---
 
