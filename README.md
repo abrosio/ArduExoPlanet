@@ -36,8 +36,8 @@ Il firmware utilizzato per il prototipo è basato sul progetto realizzato da PLA
 I file per stampare in 3D il modello finale chiamato modello implementato possono essere reperiti qui:  
 [Thingiverse - ArduExoplanet Model](https://www.thingiverse.com/thing:6888870)
 
-![Interface Example](Arduexo2.png)
-![Interface Example](Arduexo.png)
+![Foto esempio](Arduexo2.png)
+![Foto esempio 2](Arduexo.png)
 
 ---
 
