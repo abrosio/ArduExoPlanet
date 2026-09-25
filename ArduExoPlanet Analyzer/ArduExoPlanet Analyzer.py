@@ -1,210 +1,333 @@
-import serial
-import time
-import matplotlib.pyplot as plt
-import tkinter as tk
-from tkinter import ttk, filedialog
-from datetime import datetime
-import serial.tools.list_ports
-import ttkbootstrap as ttkb
-import threading
-from queue import Queue
-from matplotlib.animation import FuncAnimation
 import os
+import sys
+import threading
+import time
+from collections import deque
+from datetime import datetime
+from queue import Empty, Queue
 
-times = []
-values = []
-ser = None
-start_time = None
-log_directory = None
-update_interval = 50
-logged_data = []
-data_queue = Queue()
-previous_value = None
+import serial
+import serial.tools.list_ports
+from PyQt6.QtCore import QTimer, pyqtSignal
+from PyQt6.QtGui import QIcon
+from PyQt6.QtWidgets import (
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
+    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton, QVBoxLayout, QWidget,
+)
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.figure import Figure
 
-def read_serial_data():
-    global previous_value, logged_data
-    while ser and ser.is_open:
-        try:
-            if ser.in_waiting > 0:
-                line = ser.readline().decode('utf-8').strip()
-                current_time = time.time() - start_time
-                try:
-                    value = float(line)
-                    variation = value - previous_value if previous_value is not None else 0
-                    previous_value = value
-                    data_queue.put((current_time, value, variation))
-                    logged_data.append((current_time, value))
-                except ValueError:
-                    pass
-            else:
-                time.sleep(0.01)
-        except Exception as e:
-            print(f"Errore durante la lettura dei dati: {e}")
-            break
+PLOT_POINTS = 100
+# Conserva alcuni campioni recenti per aggiornare il grafico al cambio del filtro.
+RECENT_RAW_POINTS = 5000
+BAUD_RATES = (9600, 115200, 19200, 38400, 57600, 4800, 250000)
 
-def update_graph(frame):
-    while not data_queue.empty():
-        current_time, value, variation = data_queue.get()
-        times.append(current_time)
-        values.append(value)
-        if len(times) > 100:
-            times.pop(0)
-            values.pop(0)
-    line.set_data(times, values)
-    ax.relim()
-    ax.autoscale_view()
-    return line,
 
-def save_log():
-    global log_directory, logged_data
-    if not log_directory:
-        log_directory = filedialog.askdirectory(title="Seleziona la directory di salvataggio")
-        if not log_directory:
-            print("Errore: Nessuna directory selezionata.")
+class Analyzer(QMainWindow):
+    serial_error = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('ArduExoPlanet Analyzer 1.0')
+        icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icon.ico')
+        if os.path.isfile(icon):
+            self.setWindowIcon(QIcon(icon))
+
+        self.port = None
+        self.reader = None
+        self.stop_event = None
+        self.started = None
+        self.log_directory = None
+        self.log_data = []
+        self.log_lock = threading.Lock()
+        self.incoming = Queue()
+        self.recent_raw = deque(maxlen=RECENT_RAW_POINTS)
+        self.times = deque(maxlen=PLOT_POINTS)
+        self.values = deque(maxlen=PLOT_POINTS)
+        self.last_plotted_value = None
+        self.closing = False
+
+        self.setStyleSheet('''
+            QWidget { background: #243746; color: #e6edf3; font-size: 12px; }
+            QComboBox, QLineEdit, QDoubleSpinBox {
+                background: #172a38; color: #f2f6fa; border: 1px solid #557085;
+                border-radius: 4px; padding: 5px;
+            }
+            QComboBox QAbstractItemView { background: #172a38; color: #f2f6fa; }
+            QPushButton { background: #426173; border: 1px solid #668396;
+                border-radius: 5px; padding: 6px 10px; }
+            QPushButton:hover { background: #55798e; }
+            QPushButton#start { background: #188754; border-color: #25a66b; }
+            QPushButton#start:hover { background: #1ca767; }
+            QCheckBox { spacing: 6px; }
+        ''')
+        main = QWidget(self)
+        self.setCentralWidget(main)
+        layout = QVBoxLayout(main)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(12)
+        port_row = QHBoxLayout()
+        port_row.setSpacing(10)
+        layout.addLayout(port_row)
+        port_row.addWidget(QLabel('Seleziona la Porta COM:'))
+        self.port_combo = QComboBox()
+        port_row.addWidget(self.port_combo)
+        scan = QPushButton('Scansiona')
+        scan.clicked.connect(self.update_ports)
+        port_row.addWidget(scan)
+        port_row.addSpacing(14)
+        port_row.addWidget(QLabel('Seleziona il Baud Rate:'))
+        self.baud_combo = QComboBox()
+        self.baud_combo.addItems(map(str, BAUD_RATES))
+        self.baud_combo.setCurrentText('250000')
+        port_row.addWidget(self.baud_combo)
+        port_row.addStretch()
+
+        button_row = QHBoxLayout()
+        button_row.setSpacing(10)
+        layout.addLayout(button_row)
+        self.start_button = QPushButton('Avvia')
+        self.start_button.setObjectName('start')
+        self.start_button.clicked.connect(self.toggle_serial)
+        button_row.addWidget(self.start_button)
+        for title, handler in (
+            ('Salva Log', self.save_log), ('Reset Plot', self.reset_plot),
+            ('Screenshot', self.save_screenshot),
+        ):
+            button = QPushButton(title)
+            button.clicked.connect(handler)
+            button_row.addWidget(button)
+        button_row.addSpacing(30)
+        button_row.addStretch(1)
+        button_row.addWidget(QLabel('Velocità del Plot (ms):'))
+        self.speed_entry = QLineEdit('50')
+        self.speed_entry.setFixedWidth(65)
+        button_row.addWidget(self.speed_entry)
+        speed_button = QPushButton('Aggiorna Velocità')
+        speed_button.clicked.connect(self.update_plot_speed)
+        button_row.addWidget(speed_button)
+        button_row.addSpacing(150)
+
+        # Terza riga: opzioni del filtro, sotto ai controlli di acquisizione.
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(12)
+        layout.addLayout(filter_row)
+        self.filter_check = QCheckBox('Attiva filtro')
+        filter_row.addWidget(self.filter_check)
+        filter_row.addSpacing(16)
+        filter_row.addWidget(QLabel('Soglia (variazione minima):'))
+        self.threshold = QDoubleSpinBox()
+        self.threshold.setFixedWidth(105)
+        self.threshold.setRange(0.0, 1_000_000.0)
+        self.threshold.setDecimals(2)
+        self.threshold.setSingleStep(0.5)
+        self.threshold.setValue(5.0)
+        filter_row.addWidget(self.threshold)
+        filter_row.addStretch()
+        self.filter_check.toggled.connect(self.rebuild_plot)
+        self.threshold.valueChanged.connect(self.rebuild_plot)
+
+        self.figure = Figure(figsize=(8, 6), facecolor='#243746')
+        self.ax = self.figure.add_subplot(111)
+        self.ax.set_facecolor('#172a38')
+        self.ax.set_xlabel('Tempo (s)', fontsize=10, color='#e6edf3')
+        self.ax.set_ylabel('Luce', fontsize=10, color='#e6edf3')
+        self.ax.set_title('ArduExoPlanet Analyzer - Photometry Simulation', fontsize=12, color='#e6edf3')
+        self.ax.tick_params(colors='#e6edf3')
+        for spine in self.ax.spines.values():
+            spine.set_color('#7992a3')
+        self.ax.grid(True, color='#557085', alpha=0.65)
+        (self.line,) = self.ax.plot([], [], color='#40c4ff', lw=2)
+        self.figure.tight_layout(pad=2)
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        layout.addWidget(self.canvas, stretch=1)
+        self.resize(940, 720)
+
+        self.serial_error.connect(self.on_serial_error)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_graph)
+        self.timer.start(50)
+        self.update_ports()
+
+    def update_ports(self):
+        selected = self.port_combo.currentText()
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        self.port_combo.clear()
+        self.port_combo.addItems(ports)
+        if selected in ports:
+            self.port_combo.setCurrentText(selected)
+        if not ports:
+            print('Errore: Nessuna porta seriale disponibile.')
+
+    def toggle_serial(self):
+        if self.port is None:
+            self.start_serial()
+        else:
+            self.stop_serial()
+
+    def start_serial(self):
+        port_name = self.port_combo.currentText()
+        if not port_name:
+            print('Errore: Selezionare una porta e un baud rate.')
             return
-    filename = os.path.join(log_directory, f"fotoresistenza_log_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt")
-    try:
-        with open(filename, 'w') as f:
-            f.write("Tempo (s);  Valore Fotoresistenza\n")
-            for t, v in logged_data:
-                f.write(f"{t:.2f};       {v:.2f}\n")
-        print(f"Log salvato in {filename}")
-    except Exception as e:
-        print(f"Errore durante il salvataggio del log: {e}")
-
-def start_serial():
-    global ser, start_time, previous_value
-    port = port_combobox.get()
-    baud_rate = int(baud_combobox.get())
-    if not port or not baud_rate:
-        print("Errore: Selezionare una porta e un baud rate.")
-        return
-    try:
-        ser = serial.Serial(port, baud_rate, timeout=0.1)
-        start_time = time.time()
-        previous_value = None
-        threading.Thread(target=read_serial_data, daemon=True).start()
-        start_button.config(text="Ferma", command=stop_serial)
-        print("Comunicazione avviata.")
-    except Exception as e:
-        print(f"Errore durante l'inizializzazione: {e}")
-
-def stop_serial():
-    global ser
-    if ser and ser.is_open:
-        ser.close()
-        start_button.config(text="Avvia", command=start_serial)
-        print("Comunicazione fermata.")
-
-def get_available_ports():
-    ports = serial.tools.list_ports.comports()
-    return [port.device for port in ports]
-
-def update_ports():
-    available_ports = get_available_ports()
-    if not available_ports:
-        print("Errore: Nessuna porta seriale disponibile.")
-        return
-    port_combobox['values'] = available_ports
-    if port_combobox.get() not in available_ports:
-        port_combobox.set('')
-    if available_ports:
-        port_combobox.set(available_ports[0])
-
-def update_plot_speed():
-    global update_interval, ani
-    try:
-        new_interval = int(speed_entry.get())
-        if new_interval <= 0:
-            raise ValueError("Il valore deve essere positivo.")
-        update_interval = new_interval
-        ani.event_source.interval = update_interval
-        print(f"Velocità del plot impostata su {update_interval} ms")
-    except ValueError:
-        print("Errore: Inserisci un valore numerico valido per la velocità del plot.")
-
-fig, ax = plt.subplots(figsize=(8, 6))
-ax.set_xlabel("Tempo (s)", fontsize=10)
-ax.set_ylabel("Luce", fontsize=10)
-ax.set_title("ArduExoPlanet Analyzer - Photometry Simulation", fontsize=12)
-ax.grid(True)
-line, = ax.plot([], [], lw=2)
-
-def reset_plot():
-    global times, values, logged_data
-    times.clear()
-    values.clear()
-    logged_data.clear()
-    line.set_data([], [])
-    ax.relim()
-    ax.autoscale_view()
-    canvas.draw()
-
-def save_screenshot():
-    file_path = filedialog.asksaveasfilename(
-        defaultextension=".png",
-        filetypes=[("PNG files", "*.png"), ("All files", "*.*")],
-        title="Scegli dove salvare lo screenshot"
-    )
-    if file_path:
         try:
-            fig.savefig(file_path, dpi=300)
-        except Exception as e:
-            print(f"Errore durante il salvataggio dello screenshot: {e}")
+            port = serial.Serial(port_name, int(self.baud_combo.currentText()), timeout=0.1)
+        except (ValueError, serial.SerialException, OSError) as exc:
+            print(f"Errore durante l'inizializzazione: {exc}")
+            return
+        self.port = port
+        self.started = time.monotonic()
+        self.stop_event = threading.Event()
+        self.reader = threading.Thread(target=self.read_serial, args=(port, self.started, self.stop_event), daemon=True)
+        self.reader.start()
+        self.start_button.setText('Ferma')
+        print('Comunicazione avviata.')
 
-def start_gui():
-    global canvas, root, speed_entry, port_combobox, baud_combobox, start_button, ani
-    root = ttkb.Window(themename="superhero")
-    root.title("ArduExoPlanet Analyzer 1.0")
-    try:
-        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.ico")
-        root.iconbitmap(icon_path)
-    except Exception as e:
-        print(f"Errore durante il caricamento dell'icona: {e}")
+    def read_serial(self, port, started, stopped):
+        try:
+            while not stopped.is_set():
+                raw = port.readline()
+                if stopped.is_set():
+                    break
+                if not raw:
+                    continue
+                try:
+                    value = float(raw.decode('utf-8').strip())
+                except (UnicodeDecodeError, ValueError):
+                    continue
+                elapsed = time.monotonic() - started
+                with self.log_lock:
+                    self.log_data.append((elapsed, value))
+                self.incoming.put((elapsed, value))
+        except (serial.SerialException, OSError) as exc:
+            if not stopped.is_set():
+                self.serial_error.emit(str(exc))
 
-    frame_ports = ttk.Frame(root)
-    frame_ports.pack(padx=10, pady=10, fill="x")
-    tk.Label(frame_ports, text="Seleziona la Porta COM:", font=('Arial', 10)).pack(side="left", padx=5)
-    global port_combobox
-    port_combobox = ttk.Combobox(frame_ports, width=10, font=('Arial', 10), state="readonly")
-    port_combobox.pack(side="left", padx=5)
-    scan_button = ttkb.Button(frame_ports, text="Scansiona", command=update_ports, style="TButton", width=12, takefocus=False)
-    scan_button.pack(side="left", padx=5)
-    tk.Label(frame_ports, text="Seleziona il Baud Rate:", font=('Arial', 10)).pack(side="left", padx=5)
-    baud_rates = [9600, 115200, 19200, 38400, 57600, 4800, 250000]
-    global baud_combobox
-    baud_combobox = ttk.Combobox(frame_ports, values=baud_rates, width=10, font=('Arial', 10), state="readonly")
-    baud_combobox.set(9600)
-    baud_combobox.pack(side="left", padx=5)
+    def on_serial_error(self, message):
+        if not self.closing:
+            print(f'Errore durante la lettura dei dati: {message}')
+            self.stop_serial()
 
-    frame_buttons = ttk.Frame(root)
-    frame_buttons.pack(padx=10, pady=10, fill="x")
-    global start_button
-    start_button = ttkb.Button(frame_buttons, text="Avvia", command=start_serial, style="TButton", width=12, takefocus=False)
-    start_button.pack(side="left", padx=5)
-    save_button = ttkb.Button(frame_buttons, text="Salva Log", command=save_log, style="TButton", width=12, takefocus=False)
-    save_button.pack(side="left", padx=5)
-    reset_button = ttkb.Button(frame_buttons, text="Reset Plot", command=reset_plot, style="TButton", width=12, takefocus=False)
-    reset_button.pack(side="left", padx=5)
-    screenshot_button = ttkb.Button(frame_buttons, text="Screenshot", command=save_screenshot, style="TButton", width=12, takefocus=False)
-    screenshot_button.pack(side="left", padx=5)
-    tk.Label(frame_buttons, text="Velocità del Plot (ms):", font=('Arial', 10)).pack(side="left", padx=5)
-    speed_entry = ttk.Entry(frame_buttons, width=8, font=('Arial', 10))
-    speed_entry.insert(0, str(update_interval))
-    speed_entry.pack(side="left", padx=5)
-    speed_button = ttkb.Button(frame_buttons, text="Aggiorna Velocità", command=update_plot_speed, style="TButton", width=16, takefocus=False)
-    speed_button.pack(side="left", padx=5)
+    def stop_serial(self):
+        if self.port is None:
+            return
+        self.stop_event.set()
+        port, self.port = self.port, None
+        try:
+            port.close()
+        except (serial.SerialException, OSError) as exc:
+            print(f'Errore durante la chiusura della porta: {exc}')
+        self.start_button.setText('Avvia')
+        print('Comunicazione fermata.')
 
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-    canvas = FigureCanvasTkAgg(fig, master=root)
-    canvas.get_tk_widget().pack(padx=20, pady=20)
-    
-    update_ports()
-    
-    ani = FuncAnimation(fig, update_graph, interval=update_interval, blit=False)
-    
-    root.mainloop()
+    def add_plot_sample(self, elapsed, value):
+        # Un punto per ogni campione: il filtro azzera solo le variazioni
+        # piccole rispetto all'ultimo livello rappresentato, senza creare buchi
+        # sull'asse dei tempi. Il log continua a contenere il valore originale.
+        if (self.filter_check.isChecked() and self.last_plotted_value is not None
+                and abs(value - self.last_plotted_value) <= self.threshold.value()):
+            plotted_value = self.last_plotted_value
+        else:
+            plotted_value = value
+        self.times.append(elapsed)
+        self.values.append(plotted_value)
+        self.last_plotted_value = plotted_value
 
-plt.tight_layout(pad=2.0)
+    def redraw(self):
+        self.line.set_data(self.times, self.values)
+        self.ax.relim()
+        self.ax.autoscale_view()
+        self.canvas.draw_idle()
 
-start_gui()
+    def update_graph(self):
+        changed = False
+        while True:
+            try:
+                elapsed, value = self.incoming.get_nowait()
+            except Empty:
+                break
+            self.recent_raw.append((elapsed, value))
+            self.add_plot_sample(elapsed, value)
+            changed = True
+        if changed:
+            self.redraw()
+
+    def rebuild_plot(self, *_):
+        # Aggiorna anche i punti già acquisiti quando si cambia filtro o soglia.
+        self.update_graph()
+        self.times.clear()
+        self.values.clear()
+        self.last_plotted_value = None
+        for elapsed, value in self.recent_raw:
+            self.add_plot_sample(elapsed, value)
+        self.redraw()
+
+    def update_plot_speed(self):
+        try:
+            interval = int(self.speed_entry.text())
+            if interval <= 0:
+                raise ValueError
+        except ValueError:
+            print('Errore: Inserisci un valore numerico valido per la velocità del plot.')
+            return
+        self.timer.setInterval(interval)
+        print(f'Velocità del plot impostata su {interval} ms')
+
+    def save_log(self):
+        if not self.log_directory:
+            self.log_directory = QFileDialog.getExistingDirectory(self, 'Seleziona la directory di salvataggio')
+            if not self.log_directory:
+                print('Errore: Nessuna directory selezionata.')
+                return
+        filename = os.path.join(self.log_directory, f"fotoresistenza_log_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt")
+        try:
+            with self.log_lock:
+                snapshot = self.log_data.copy()
+            with open(filename, 'w') as output:
+                output.write('Tempo (s);  Valore Fotoresistenza\n')
+                for elapsed, value in snapshot:
+                    output.write(f'{elapsed:.2f};       {value:.2f}\n')
+            print(f'Log salvato in {filename}')
+        except OSError as exc:
+            print(f'Errore durante il salvataggio del log: {exc}')
+
+    def reset_plot(self):
+        with self.log_lock:
+            self.log_data.clear()
+            while True:
+                try:
+                    self.incoming.get_nowait()
+                except Empty:
+                    break
+        self.recent_raw.clear()
+        self.times.clear()
+        self.values.clear()
+        self.last_plotted_value = None
+        self.redraw()
+
+    def save_screenshot(self):
+        filename, _ = QFileDialog.getSaveFileName(self, 'Scegli dove salvare lo screenshot', '', 'PNG files (*.png);;All files (*)')
+        if filename:
+            if not os.path.splitext(filename)[1]:
+                filename += '.png'
+            try:
+                self.figure.savefig(filename, dpi=300)
+            except (OSError, ValueError) as exc:
+                print(f'Errore durante il salvataggio dello screenshot: {exc}')
+
+    def closeEvent(self, event):
+        self.closing = True
+        self.timer.stop()
+        self.stop_serial()
+        event.accept()
+
+
+def main():
+    app = QApplication(sys.argv)
+    window = Analyzer()
+    window.show()
+    return app.exec()
+
+
+if __name__ == '__main__':
+    sys.exit(main())
